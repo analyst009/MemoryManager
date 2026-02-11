@@ -23,6 +23,7 @@ int main(void) {
             printf("[ERROR] Invalid input. Enter a number between 1 and 4.\n");
             continue;
         }
+        while (getchar() != '\n'); /* clear newline left by scanf */
 
         switch (choice) {
             case 1:
