@@ -1,9 +1,9 @@
-﻿#include "memory_manager.h"
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
 #include <string.h>
+#include <thread>
 
 #ifdef _WIN32
     #include <io.h>
@@ -15,13 +15,24 @@
     #define SYNC_FUNC(fd) fsync(fd)
 #endif
 
+#include "memory_manager.h"
+
 #define CHUNK_SIZE (10ULL * 1024ULL * 1024ULL * 1024ULL) /* 10 GB */
 #define MAX_ALLOCATIONS 100
+#define MAX_PATH_LENGTH 512
+#define MAX_PATHS 32
 
 typedef struct {
     void* ptr;
     size_t size;
 } Allocation;
+
+typedef struct {
+    char filepath[MAX_PATH_LENGTH];
+    int start_chunk;
+    int end_chunk;
+    double* elapsed_time;
+} ThreadArgs;
 
 static Allocation allocations[MAX_ALLOCATIONS];
 static int allocation_count = 0;
@@ -75,12 +86,8 @@ void mm_show_allocations(void) {
     printf("===============================================\n");
 }
 
-void mm_dump_all_memory(void) {
-    if (allocation_count == 0) {
-        printf("[INFO] No memory allocated yet. Nothing to dump.\n");
-        return;
-    }
-
+/* Helper function for thread to dump assigned memory chunks */
+static void thread_dump_chunks(ThreadArgs* args) {
 #ifdef _WIN32
     LARGE_INTEGER freq, wall_start, wall_end;
     FILETIME start_creation, start_exit, start_kernel, start_user;
@@ -93,39 +100,36 @@ void mm_dump_all_memory(void) {
     struct timeval wall_start, wall_end;
     gettimeofday(&wall_start, NULL);
 #endif
-    
-    time_t current_time = time(NULL);
-    struct tm* time_info = localtime(&current_time);
-    
-    char filename[256];
-    strftime(filename, sizeof(filename), "dump_file_%Y%m%d_%H%M%S.bin", time_info);
-
-    FILE* dump_file = fopen(filename, "wb");
-    if (dump_file == NULL) {
-        printf("[ERROR] Failed to create dump file: %s\n", filename);
-        return;
-    }
 
     unsigned long long total_bytes_written = 0ULL;
-    
-    printf("\n[INFO] Dumping memory to file: %s\n", filename);
-    
-    for (int i = 0; i < allocation_count; ++i) {
-        size_t bytes_written = fwrite(allocations[i].ptr, 1, allocations[i].size, dump_file);
-        if (bytes_written != allocations[i].size) {
-            printf("[WARNING] Chunk #%d: Wrote %zu bytes instead of %zu bytes\n", 
-                   i + 1, bytes_written, allocations[i].size);
+
+    printf("[INFO] Thread writing to: %s (chunks %d to %d)\n", 
+           args->filepath, args->start_chunk + 1, args->end_chunk + 1);
+
+    /* Create file even if no chunks assigned */
+    FILE* dump_file = fopen(args->filepath, "wb");
+    if (dump_file == NULL) {
+        printf("[ERROR] Failed to create dump file: %s\n", args->filepath);
+    } else {
+        if (args->start_chunk <= args->end_chunk) {
+            for (int i = args->start_chunk; i <= args->end_chunk; ++i) {
+                size_t bytes_written = fwrite(allocations[i].ptr, 1, allocations[i].size, dump_file);
+                if (bytes_written != allocations[i].size) {
+                    printf("[WARNING] Chunk #%d: Wrote %zu bytes instead of %zu bytes\n", 
+                           i + 1, bytes_written, allocations[i].size);
+                }
+                total_bytes_written += (unsigned long long)bytes_written;
+            }
+
+            fflush(dump_file);
+            int sync_result = SYNC_FUNC(fileno(dump_file));
+            if (sync_result != 0) {
+                printf("[WARNING] Sync failed with error code: %d\n", sync_result);
+            }
         }
-        total_bytes_written += (unsigned long long)bytes_written;
-    }
 
-    fflush(dump_file);
-    int sync_result = SYNC_FUNC(fileno(dump_file));
-    if (sync_result != 0) {
-        printf("[WARNING] Sync failed with error code: %d\n", sync_result);
+        fclose(dump_file);
     }
-
-    fclose(dump_file);
 
 #ifdef _WIN32
     QueryPerformanceCounter(&wall_end);
@@ -155,12 +159,133 @@ void mm_dump_all_memory(void) {
 
     double size_gb = (double)total_bytes_written / (1024.0 * 1024.0 * 1024.0);
 
-    printf("[SUCCESS] Memory dump completed:\n");
-    printf("  File: %s\n", filename);
+    printf("[SUCCESS] Thread completed writing:\n");
+    printf("  File: %s\n", args->filepath);
     printf("  Total Data Written: %.2f GB\n", size_gb);
     printf("  Wall-Clock Time: %.6f seconds\n", wall_time);
     printf("  CPU Time: %.6f seconds\n", cpu_time);
     printf("===============================================\n");
+    
+    *args->elapsed_time = wall_time;
+}
+
+void mm_dump_all_memory(void) {
+    if (allocation_count == 0) {
+        printf("[INFO] No memory allocated yet. Nothing to dump.\n");
+        return;
+    }
+
+    char paths_line[2048];
+    char paths[MAX_PATHS][MAX_PATH_LENGTH];
+    int path_count = 0;
+
+    printf("\nEnter comma-separated directory paths to dump memory (e.g., ./out1,./out2): ");
+    if (fgets(paths_line, sizeof(paths_line), stdin) == NULL) {
+        printf("[ERROR] Failed to read paths. Dump cancelled.\n");
+        return;
+    }
+    size_t llen = strlen(paths_line);
+    if (llen > 0 && paths_line[llen - 1] == '\n') paths_line[llen - 1] = '\0';
+
+    /* parse comma-separated values into paths[][] */
+    char* saveptr = NULL;
+    char* token = strtok_r(paths_line, ",", &saveptr);
+    while (token != NULL && path_count < MAX_PATHS) {
+        /* trim leading/trailing whitespace */
+        while (*token == ' ' || *token == '\t') token++;
+        size_t tlen = strlen(token);
+        while (tlen > 0 && (token[tlen - 1] == ' ' || token[tlen - 1] == '\t')) {
+            token[tlen - 1] = '\0';
+            tlen--;
+        }
+        if (tlen > 0) {
+            strncpy(paths[path_count], token, MAX_PATH_LENGTH - 1);
+            paths[path_count][MAX_PATH_LENGTH - 1] = '\0';
+            path_count++;
+        }
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    if (path_count == 0) {
+        printf("[ERROR] No valid paths provided. Dump cancelled.\n");
+        return;
+    }
+
+    time_t current_time = time(NULL);
+    struct tm* time_info = localtime(&current_time);
+    
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", time_info);
+    
+    /* Build filenames for each provided path */
+    char filenames[MAX_PATHS][MAX_PATH_LENGTH];
+    for (int i = 0; i < path_count; ++i) {
+        snprintf(filenames[i], MAX_PATH_LENGTH, "%s/dump_file_%s.bin", paths[i], timestamp);
+    }
+
+#ifdef _WIN32
+    LARGE_INTEGER freq, total_start, total_end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&total_start);
+#else
+    struct timeval total_start, total_end;
+    gettimeofday(&total_start, NULL);
+#endif
+
+    /* Distribute chunks across path_count threads (±1) */
+    int N = path_count;
+    int base = allocation_count / N;
+    int extra = allocation_count % N; /* first 'extra' threads get one more */
+
+    ThreadArgs* args = new ThreadArgs[N];
+    double* elapsed_times = new double[N];
+    std::thread* threads = new std::thread[N];
+
+    int start = 0;
+    for (int i = 0; i < N; ++i) {
+        int count = base + (i < extra ? 1 : 0);
+        args[i].start_chunk = start;
+        args[i].end_chunk = (count > 0) ? (start + count - 1) : (start - 1);
+        args[i].elapsed_time = &elapsed_times[i];
+        elapsed_times[i] = 0.0;
+        /* copy filepath */
+        args[i].filepath[0] = '\0';
+        strncpy(args[i].filepath, filenames[i], MAX_PATH_LENGTH - 1);
+        args[i].filepath[MAX_PATH_LENGTH - 1] = '\0';
+        start += count;
+    }
+
+    printf("\n[INFO] Starting %d threads to dump memory...\n", N);
+    for (int i = 0; i < N; ++i) {
+        printf("  Thread %d: Chunks %d to %d -> %s\n", i + 1, args[i].start_chunk + 1,
+               args[i].end_chunk + 1, args[i].filepath);
+        threads[i] = std::thread(thread_dump_chunks, &args[i]);
+    }
+
+    for (int i = 0; i < N; ++i) threads[i].join();
+
+
+#ifdef _WIN32
+    QueryPerformanceCounter(&total_end);
+    double total_wall_time = (double)(total_end.QuadPart - total_start.QuadPart) / freq.QuadPart;
+#else
+    gettimeofday(&total_end, NULL);
+    double total_wall_time = (total_end.tv_sec - total_start.tv_sec) + 
+                             (total_end.tv_usec - total_start.tv_usec) / 1000000.0;
+#endif
+
+    printf("\n===============================================\n");
+    printf("[SUMMARY] All threads completed:\n");
+    for (int i = 0; i < N; ++i) {
+        printf("  Thread %d -> %s\n", i + 1, args[i].filepath);
+        printf("    Time: %.6f seconds\n", elapsed_times[i]);
+    }
+    printf("  Total Time: %.6f seconds\n", total_wall_time);
+    printf("===============================================\n");
+
+    delete [] args;
+    delete [] elapsed_times;
+    delete [] threads;
 }
 
 void mm_free_all(void) {
