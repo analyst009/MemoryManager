@@ -1,3 +1,31 @@
+std::queue<Packet*> dump_queue;
+
+    for(int i = 0; i < allocation_count; ++i)
+    {
+        unsigned char * ptr = (unsigned char *)allocations[i].ptr;
+        size_t chunk_size = CHUNK_SIZE;
+        while(chunk_size)
+        {
+            Packet * pckt_ptr = new Packet;
+            if(chunk_size > PACKET_SIZE)
+                {
+                    pckt_ptr->start_address = ptr;
+                    pckt_ptr->size = PACKET_SIZE;
+                    ptr = ptr + PACKET_SIZE;
+                    chunk_size = chunk_size - PACKET_SIZE;
+
+                }
+            else
+                {
+                    pckt_ptr->start_address = ptr;
+                    pckt_ptr->size = chunk_size;
+                    chunk_size = 0;
+                }
+            dump_queue.push(pckt_ptr);
+        }
+    }
+
+
 #ifndef MEMORY_MANAGER_H
 #define MEMORY_MANAGER_H
 
